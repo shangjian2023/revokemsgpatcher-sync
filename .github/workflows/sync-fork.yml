@@ -1,0 +1,107 @@
+name: Sync fork with upstream
+
+# 每天 04:23 UTC = 12:23 北京时间。
+# 刻意避开整点：GitHub 在整点负载高，schedule 容易被延迟或丢弃。
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-revokemsgpatcher-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fast-forward fork from upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward ${{ vars.FORK_REPO }} from ${{ vars.UPSTREAM_REPO }}
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          FORK_REPO: ${{ vars.FORK_REPO }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          BRANCH: ${{ vars.BRANCH }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN}" ] || [ -z "${FORK_REPO}" ] || [ -z "${UPSTREAM_REPO}" ]; then
+            echo "::error::缺少 FORK_SYNC_TOKEN secret 或 FORK_REPO/UPSTREAM_REPO 变量"
+            exit 1
+          fi
+
+          BRANCH="${BRANCH:-master}"
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+
+          echo "==> 克隆 fork: ${FORK_REPO} (${BRANCH})"
+          git clone --branch "$BRANCH" --single-branch \
+            "https://x-access-token:${GH_TOKEN}@github.com/${FORK_REPO}.git" fork
+
+          cd fork
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$BRANCH"
+          git fetch --no-tags origin "$BRANCH"
+
+          echo "==> fork HEAD     : $(git rev-parse origin/${BRANCH})"
+          echo "==> upstream HEAD : $(git rev-parse upstream/${BRANCH})"
+
+          if [ "$(git rev-parse origin/${BRANCH})" = "$(git rev-parse upstream/${BRANCH})" ]; then
+            echo "==> 已是最新，无需同步"
+            exit 0
+          fi
+
+          # 只允许快进：fork 若有自己的提交导致分叉，拒绝同步（绝不 force push）
+          if ! git merge-base --is-ancestor origin/${BRANCH} upstream/${BRANCH}; then
+            echo "::error::fork 与 upstream 已分叉，fast-forward 不可用，需要人工介入。不会强制推送。"
+            git log --oneline --graph -20 origin/${BRANCH} upstream/${BRANCH} || true
+            exit 1
+          fi
+
+          echo "==> 快进合并"
+          git merge --ff-only "upstream/${BRANCH}"
+
+          echo "==> 推送到 fork"
+          git push origin "HEAD:${BRANCH}"
+
+          echo "::notice::已同步 ${FORK_REPO}@${BRANCH} <- ${UPSTREAM_REPO}@${BRANCH} @ $(git rev-parse --short HEAD)"
+
+  mirror:
+    name: Mirror latest release binary into fork
+    runs-on: ubuntu-latest
+    needs: sync
+    # sync 失败或无变化时仍然镜像（上游仓库里不提交二进制，产物只在 Release 上）
+    steps:
+      - name: Download newest release asset and publish to fork
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          FORK_REPO: ${{ vars.FORK_REPO }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+        run: |
+          set -euo pipefail
+
+          echo "==> 查询上游最新 release"
+          TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          echo "   最新版本: ${TAG}"
+
+          ASSET_URL="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.assets[0].browser_download_url')"
+          ASSET_NAME="$(basename "${ASSET_URL}")"
+          echo "   资产: ${ASSET_NAME}"
+
+          curl -sSL --retry 5 --retry-delay 3 -o "/tmp/${ASSET_NAME}" "${ASSET_URL}"
+          ls -lh "/tmp/${ASSET_NAME}"
+
+          echo "==> 在 fork 里创建/更新 release ${TAG}"
+          # 已存在同名 release 就删掉重建，保证资产是新的
+          if gh release view "${TAG}" --repo "${FORK_REPO}" >/dev/null 2>&1; then
+            gh release delete "${TAG}" --repo "${FORK_REPO}" --yes --cleanup-tag || true
+          fi
+          gh release create "${TAG}" "/tmp/${ASSET_NAME}" \
+            --repo "${FORK_REPO}" \
+            --title "${TAG} (mirrored from ${UPSTREAM_REPO})" \
+            --notes "自动镜像自 ${UPSTREAM_REPO} 的 ${TAG} release。同步时间：$(date -u '+%Y-%m-%d %H:%M UTC')。"
+
+          echo "::notice::已把 ${ASSET_NAME} 镜像到 ${FORK_REPO} 的 ${TAG} release"
